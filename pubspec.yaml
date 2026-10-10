@@ -1,0 +1,36 @@
+
+name: e_project
+description: "A new Flutter project."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.4.0 # use stable Flutter 3.x (3.8.1 is not yet available)
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  carousel_slider: 
+
+  # ✅ Firebase packages (latest null-safe versions)
+  firebase_core: ^3.6.0
+  cloud_firestore: ^5.4.4
+  firebase_auth: ^5.3.3
+
+  # ✅ Cached network image
+  cached_network_image: ^3.3.1
+  firebase_messaging: ^15.2.10
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/images/

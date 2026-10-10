@@ -1,0 +1,424 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model & Architecture
+// ===============================================================
+//
+// Application: LaptopHarbor (E-Commerce Platform)
+//
+// Collections:
+// 1. users/{userId}
+//    - Document ID: Firebase Auth UID
+//    - Fields:
+//        name: string (optional, 1-100 chars)
+//        email: string (optional, valid email, <= 100 chars)
+//        phone: string (optional, 1-30 chars)
+//        address: string (optional, 1-300 chars)
+//        addresses: list of strings (optional, <= 20 entries)
+//        profileImage: string (optional, URL/path <= 2048 chars)
+//        photoUrl: string (optional, URL/path <= 2048 chars)
+//        role: string ('user' | 'admin', default 'user', immutable by non-admins)
+//        cart: list (optional, in-doc cached items <= 100 entries)
+//        wishlist: list (optional, in-doc cached product IDs <= 200 entries)
+//        createdAt: timestamp/string (immutable)
+//    - SECURITY: Passwords/hashes strictly forbidden. Read/Update restricted to owner or admin.
+//
+// 2. users/{userId}/cart/{cartId}
+//    - Fields: productId, qty, addedAt, price, etc.
+//    - SECURITY: Strictly scoped to document owner (userId == request.auth.uid).
+//
+// 3. users/{userId}/wishlist/{wishlistId}
+//    - Fields: productId, addedAt, etc.
+//    - SECURITY: Strictly scoped to document owner.
+//
+// 4. users/{userId}/orders/{orderId} & orders/{orderId}
+//    - Fields:
+//        id / orderId: string
+//        userId: string (matching creator UID, immutable)
+//        fullName: string (1-100 chars)
+//        phone: string (1-30 chars)
+//        address: string (1-300 chars)
+//        city: string (1-100 chars)
+//        postalCode: string (optional, <= 20 chars)
+//        shippingAddress: string (optional, <= 400 chars)
+//        paymentMethod: string (1-50 chars)
+//        items / products: list (<= 100 entries)
+//        subtotal, shipping, tax: numbers (>= 0)
+//        total: number (>= 0)
+//        createdAt / orderDate: timestamp or ISO string (immutable)
+//        status: string ('Pending', 'Confirmed', 'Processing', 'Shipped',
+//                        'Out for Delivery', 'Delivered', 'Cancelled')
+//    - SECURITY: User can create their own order with 'Pending' status.
+//      User can only update order if current status is 'Pending' to transition to 'Cancelled'.
+//      Admins can update all fields/statuses and delete orders.
+//
+// 5. users/{userId}/notifications/{notifId}
+//    - Fields: id, title, body, isRead (bool), timestamp, etc.
+//    - SECURITY: Owner can read, update (mark as read), or delete.
+//
+// 6. products/{productId} & laptops/{laptopId}
+//    - Fields: name, brand, category, description, price, stock, images, etc.
+//    - SECURITY: Publicly readable by all users and guests. Writes restricted to admins.
+//
+// 7. categories/{categoryId} & brands/{brandId}
+//    - Fields: name, description, icon, image, etc.
+//    - SECURITY: Publicly readable. Admin-only writes.
+//
+// 8. reviews/{productId}/items/{reviewId} & reviews/{reviewId}
+//    - Fields: userId/uid, rating (1.0 to 5.0), comment, createdAt, helpful, etc.
+//    - SECURITY: Publicly readable. Authenticated users can create reviews with rating [1..5].
+//      Author or admin can update/delete.
+//
+// 9. supportTickets/{ticketId}
+//    - Fields: ticketId, userId/uid (optional), email/userEmail, subject, message, status, createdAt.
+//    - SECURITY: Anyone can create with valid email/subject/message.
+//      Only creator or admin can read. Admin-only status updates and deletes.
+//
+// 10. faq/{faqId}
+//     - Fields: question, answer, category, order.
+//     - SECURITY: Publicly readable. Admin-only writes.
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    // Check if user is signed in with Firebase Authentication
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Check if user owns the given userId resource
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Check if document has specified field
+    function hasField(doc, field) {
+      return field in doc;
+    }
+
+    // Comprehensive Admin check (custom claim OR user document role)
+    function isAdmin() {
+      return isSignedIn() && (
+        (hasField(request.auth.token, 'role') && request.auth.token.role == 'admin') ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         hasField(get(/databases/$(database)/documents/users/$(request.auth.uid)).data, 'role') &&
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin')
+      );
+    }
+
+    // CRITICAL SECURITY: Passwords and sensitive credential hashes MUST NEVER be stored in Firestore!
+    function noPasswordOrHash(data) {
+      return !hasField(data, 'password') &&
+             !hasField(data, 'hash') &&
+             !hasField(data, 'passwordHash') &&
+             !hasField(data, 'pwd');
+    }
+
+    // Validate email format
+    function isValidEmail(email) {
+      return email is string &&
+             email.matches('^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$');
+    }
+
+    // Validate required string field length
+    function validStringLength(data, field, minLen, maxLen) {
+      return hasField(data, field) &&
+             data[field] is string &&
+             data[field].size() >= minLen &&
+             data[field].size() <= maxLen;
+    }
+
+    // Validate optional string field
+    function validOptionalString(data, field, minLen, maxLen) {
+      return !hasField(data, field) ||
+             (data[field] is string &&
+              data[field].size() >= minLen &&
+              data[field].size() <= maxLen);
+    }
+
+    // Validate immutable fields did not change during update
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // Check if user is review author
+    function isReviewAuthor(data) {
+      return isSignedIn() && (
+        (hasField(data, 'userId') && data.userId == request.auth.uid) ||
+        (hasField(data, 'uid') && data.uid == request.auth.uid)
+      );
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    // User profile data validator
+    function isValidUser(data) {
+      return noPasswordOrHash(data) &&
+             validOptionalString(data, 'name', 1, 100) &&
+             (!hasField(data, 'email') || (data.email is string && isValidEmail(data.email) && data.email.size() <= 100)) &&
+             validOptionalString(data, 'phone', 1, 30) &&
+             validOptionalString(data, 'address', 1, 300) &&
+             (!hasField(data, 'addresses') || (data.addresses is list && data.addresses.size() <= 20)) &&
+             validOptionalString(data, 'profileImage', 0, 2048) &&
+             validOptionalString(data, 'photoUrl', 0, 2048) &&
+             (!hasField(data, 'role') || (data.role is string && (data.role == 'user' || data.role == 'admin'))) &&
+             (!hasField(data, 'cart') || (data.cart is list && data.cart.size() <= 100)) &&
+             (!hasField(data, 'wishlist') || (data.wishlist is list && data.wishlist.size() <= 200));
+    }
+
+    // Product & Laptop data validator
+    function isValidProduct(data) {
+      return noPasswordOrHash(data) &&
+             validStringLength(data, 'name', 1, 200) &&
+             validOptionalString(data, 'brand', 1, 100) &&
+             validOptionalString(data, 'category', 1, 100) &&
+             validOptionalString(data, 'description', 0, 5000) &&
+             (!hasField(data, 'price') || (data.price is number && data.price >= 0)) &&
+             (!hasField(data, 'originalPrice') || (data.originalPrice is number && data.originalPrice >= 0)) &&
+             (!hasField(data, 'discount') || (data.discount is number && data.discount >= 0 && data.discount <= 100)) &&
+             (!hasField(data, 'stock') || (data.stock is int && data.stock >= 0)) &&
+             (!hasField(data, 'images') || (data.images is list && data.images.size() <= 20)) &&
+             (!hasField(data, 'specs') || (data.specs is map && data.specs.size() <= 50));
+    }
+
+    // Category & Brand data validator
+    function isValidCategoryOrBrand(data) {
+      return noPasswordOrHash(data) &&
+             validStringLength(data, 'name', 1, 100) &&
+             validOptionalString(data, 'description', 0, 1000) &&
+             validOptionalString(data, 'icon', 0, 500) &&
+             validOptionalString(data, 'image', 0, 2048);
+    }
+
+    // Order data validator
+    function isValidOrder(data) {
+      return noPasswordOrHash(data) &&
+             hasField(data, 'userId') && data.userId is string && data.userId.size() > 0 &&
+             validStringLength(data, 'fullName', 1, 100) &&
+             validStringLength(data, 'phone', 1, 30) &&
+             validStringLength(data, 'address', 1, 300) &&
+             validStringLength(data, 'city', 1, 100) &&
+             validOptionalString(data, 'postalCode', 0, 20) &&
+             validOptionalString(data, 'shippingAddress', 0, 400) &&
+             validStringLength(data, 'paymentMethod', 1, 50) &&
+             (!hasField(data, 'items') || (data.items is list && data.items.size() <= 100)) &&
+             (!hasField(data, 'products') || (data.products is list && data.products.size() <= 100)) &&
+             (!hasField(data, 'subtotal') || (data.subtotal is number && data.subtotal >= 0)) &&
+             (!hasField(data, 'shipping') || (data.shipping is number && data.shipping >= 0)) &&
+             (!hasField(data, 'tax') || (data.tax is number && data.tax >= 0)) &&
+             hasField(data, 'total') && data.total is number && data.total >= 0 &&
+             hasField(data, 'status') && data.status in [
+               'Pending', 'Confirmed', 'Processing', 'Shipped',
+               'Out for Delivery', 'Delivered', 'Cancelled'
+             ];
+    }
+
+    // Review data validator
+    function isValidReview(data) {
+      return noPasswordOrHash(data) &&
+             ((hasField(data, 'userId') && data.userId == request.auth.uid) ||
+              (hasField(data, 'uid') && data.uid == request.auth.uid)) &&
+             hasField(data, 'rating') &&
+             (data.rating is number || data.rating is int || data.rating is float) &&
+             data.rating >= 1.0 && data.rating <= 5.0 &&
+             hasField(data, 'comment') && data.comment is string &&
+             data.comment.size() > 0 && data.comment.size() <= 2000 &&
+             validOptionalString(data, 'userName', 0, 100) &&
+             (!hasField(data, 'helpful') || (data.helpful is int && data.helpful >= 0));
+    }
+
+    // Support ticket data validator
+    function isValidSupportTicket(data) {
+      return noPasswordOrHash(data) &&
+             ((hasField(data, 'email') && data.email is string && isValidEmail(data.email) && data.email.size() <= 100) ||
+              (hasField(data, 'userEmail') && data.userEmail is string && isValidEmail(data.userEmail) && data.userEmail.size() <= 100)) &&
+             validStringLength(data, 'subject', 1, 200) &&
+             validStringLength(data, 'message', 1, 5000) &&
+             validOptionalString(data, 'category', 1, 100) &&
+             validOptionalString(data, 'userName', 0, 100) &&
+             validOptionalString(data, 'name', 0, 100) &&
+             validOptionalString(data, 'status', 1, 50) &&
+             (!isSignedIn() || !hasField(data, 'userId') || data.userId == request.auth.uid) &&
+             (!isSignedIn() || !hasField(data, 'uid') || data.uid == request.auth.uid);
+    }
+
+    // FAQ data validator
+    function isValidFaq(data) {
+      return noPasswordOrHash(data) &&
+             validStringLength(data, 'question', 1, 500) &&
+             validStringLength(data, 'answer', 1, 5000) &&
+             (!hasField(data, 'order') || (data.order is int || data.order is number)) &&
+             validOptionalString(data, 'category', 1, 100);
+    }
+
+    // ===============================================================
+    // Collection Rules
+    // ===============================================================
+
+    // 1. Users collection and user-specific subcollections
+    match /users/{userId} {
+      // User can read their own profile; Admin can read all users
+      allow read: if isOwner(userId) || isAdmin();
+
+      // User registration: non-admins cannot assign themselves 'admin' role
+      allow create: if isSignedIn() &&
+                       isValidUser(request.resource.data) &&
+                       (
+                         (isOwner(userId) && (!hasField(request.resource.data, 'role') || request.resource.data.role == 'user')) ||
+                         isAdmin()
+                       );
+
+      // User profile update: non-admins cannot change their role or immutable createdAt
+      allow update: if isSignedIn() &&
+                       isValidUser(request.resource.data) &&
+                       (
+                         (isOwner(userId) && areImmutableFieldsUnchanged(['role', 'createdAt'])) ||
+                         isAdmin()
+                       );
+
+      // Admin can delete user profiles
+      allow delete: if isAdmin();
+
+      // Cart subcollection
+      match /cart/{cartId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && noPasswordOrHash(request.resource.data);
+      }
+
+      // Wishlist subcollection
+      match /wishlist/{wishlistId} {
+        allow read, delete: if isOwner(userId);
+        allow create, update: if isOwner(userId) && noPasswordOrHash(request.resource.data);
+      }
+
+      // User Orders subcollection
+      match /orders/{orderId} {
+        allow read: if isOwner(userId) || isAdmin();
+        allow create: if (isOwner(userId) || isAdmin()) && isValidOrder(request.resource.data);
+        allow update: if isAdmin() || (
+          isOwner(userId) &&
+          resource.data.status == 'Pending' &&
+          request.resource.data.status == 'Cancelled' &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        );
+        allow delete: if isAdmin();
+      }
+
+      // User Notifications subcollection
+      match /notifications/{notifId} {
+        allow read, delete: if isOwner(userId);
+        allow create: if (isOwner(userId) || isAdmin()) && noPasswordOrHash(request.resource.data);
+        allow update: if isOwner(userId) &&
+                         noPasswordOrHash(request.resource.data) &&
+                         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead']);
+      }
+    }
+
+    // 2. Products collection
+    match /products/{productId} {
+      allow read: if true;
+      allow create, update: if isAdmin() && isValidProduct(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    // 3. Laptops collection (alias / catalog)
+    match /laptops/{laptopId} {
+      allow read: if true;
+      allow create, update: if isAdmin() && isValidProduct(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    // 4. Categories collection
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow create, update: if isAdmin() && isValidCategoryOrBrand(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    // 5. Brands collection
+    match /brands/{brandId} {
+      allow read: if true;
+      allow create, update: if isAdmin() && isValidCategoryOrBrand(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    // 6. Global Orders collection
+    match /orders/{orderId} {
+      // Order owner or admin can read
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+
+      // Authenticated user can create their own order with 'Pending' status
+      allow create: if isSignedIn() &&
+                       request.resource.data.userId == request.auth.uid &&
+                       request.resource.data.status == 'Pending' &&
+                       isValidOrder(request.resource.data);
+
+      // Admin can update all order fields; Owner can ONLY transition from 'Pending' to 'Cancelled'
+      allow update: if isAdmin() ? isValidOrder(request.resource.data) : (
+        isSignedIn() &&
+        resource.data.userId == request.auth.uid &&
+        resource.data.status == 'Pending' &&
+        request.resource.data.status == 'Cancelled' &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+      );
+
+      // Orders cannot be deleted except by admins
+      allow delete: if isAdmin();
+    }
+
+    // 7. Reviews collections (supports both top-level and product subcollections)
+    match /reviews/{productId} {
+      allow read: if true;
+      allow write: if isAdmin();
+
+      match /items/{reviewId} {
+        allow read: if true;
+        allow create: if isSignedIn() && isValidReview(request.resource.data);
+        allow update: if (isReviewAuthor(resource.data) || isAdmin()) && isValidReview(request.resource.data);
+        allow delete: if isReviewAuthor(resource.data) || isAdmin();
+      }
+    }
+
+    match /reviews/{reviewId} {
+      allow read: if true;
+      allow create: if isSignedIn() && isValidReview(request.resource.data);
+      allow update: if (isReviewAuthor(resource.data) || isAdmin()) && isValidReview(request.resource.data);
+      allow delete: if isReviewAuthor(resource.data) || isAdmin();
+    }
+
+    // 8. Support Tickets collection
+    match /supportTickets/{ticketId} {
+      // Creator (matched by uid, userId, or email) or admin can read
+      allow read: if isAdmin() || (
+        isSignedIn() && (
+          (hasField(resource.data, 'userId') && resource.data.userId == request.auth.uid) ||
+          (hasField(resource.data, 'uid') && resource.data.uid == request.auth.uid) ||
+          (hasField(resource.data, 'email') && resource.data.email == request.auth.token.email) ||
+          (hasField(resource.data, 'userEmail') && resource.data.userEmail == request.auth.token.email)
+        )
+      );
+
+      // Anyone (guest or user) can submit a support ticket with valid data
+      allow create: if isValidSupportTicket(request.resource.data);
+
+      // Only admins can update status or resolve/delete support tickets
+      allow update: if isAdmin() && isValidSupportTicket(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    // 9. FAQs collection
+    match /faq/{faqId} {
+      allow read: if true;
+      allow create, update: if isAdmin() && isValidFaq(request.resource.data);
+      allow delete: if isAdmin();
+    }
+  }
+}
